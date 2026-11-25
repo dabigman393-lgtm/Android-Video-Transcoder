@@ -53,7 +53,10 @@ data class Clip(
     val width: Int,
     val height: Int,
     val fps: Float,
-    val hdr: Boolean
+    /** HDR flagged in the file's colour info (PQ/HLG). */
+    val hdr: Boolean,
+    /** 10-bit HDR-capable profile but no HDR tags, e.g. PS5 captures: raw PQ read as SDR. */
+    val untaggedHdr: Boolean
 )
 
 data class Plan(
@@ -277,6 +280,7 @@ class ConverterViewModel(app: Application) : AndroidViewModel(app) {
             var h = 0
             var fps = 0f
             var hdr = false
+            var tenBit = false
             try {
                 val ex = MediaExtractor()
                 try {
@@ -294,11 +298,20 @@ class ConverterViewModel(app: Application) : AndroidViewModel(app) {
                             val t = f.getInteger(MediaFormat.KEY_COLOR_TRANSFER)
                             hdr = t == MediaFormat.COLOR_TRANSFER_ST2084 || t == MediaFormat.COLOR_TRANSFER_HLG
                         }
-                        if (!hdr && f.containsKey(MediaFormat.KEY_PROFILE)) {
+                        if (f.containsKey(MediaFormat.KEY_PROFILE)) {
                             val p = f.getInteger(MediaFormat.KEY_PROFILE)
-                            hdr = p == CodecProfileLevel.VP9Profile2 ||
-                                p == CodecProfileLevel.VP9Profile2HDR ||
-                                p == CodecProfileLevel.HEVCProfileMain10HDR10
+                            tenBit = when (mime) {
+                                MediaFormat.MIMETYPE_VIDEO_HEVC -> p == CodecProfileLevel.HEVCProfileMain10 ||
+                                    p == CodecProfileLevel.HEVCProfileMain10HDR10 ||
+                                    p == CodecProfileLevel.HEVCProfileMain10HDR10Plus
+                                MediaFormat.MIMETYPE_VIDEO_VP9 -> p == CodecProfileLevel.VP9Profile2 ||
+                                    p == CodecProfileLevel.VP9Profile2HDR ||
+                                    p == CodecProfileLevel.VP9Profile2HDR10Plus
+                                MediaFormat.MIMETYPE_VIDEO_AV1 -> p == CodecProfileLevel.AV1ProfileMain10 ||
+                                    p == CodecProfileLevel.AV1ProfileMain10HDR10 ||
+                                    p == CodecProfileLevel.AV1ProfileMain10HDR10Plus
+                                else -> false
+                            }
                         }
                         break
                     }
@@ -320,13 +333,14 @@ class ConverterViewModel(app: Application) : AndroidViewModel(app) {
             }
             val fName = name; val fSize = size; val fW = w; val fH = h
             val fFps = fps; val fHdr = hdr; val fDur = dur; val fBmp = bmp
+            val fUntagged = !hdr && tenBit
             main.post {
                 if (fDur <= 0L || fW <= 0 || fH <= 0) {
                     error = "Couldn't read that video."
                 } else {
-                    clip = Clip(uri, fName, fSize, fDur, fW, fH, fFps, fHdr)
+                    clip = Clip(uri, fName, fSize, fDur, fW, fH, fFps, fHdr, fUntagged)
                     thumb = fBmp
-                    toneMap = fHdr
+                    toneMap = fHdr || fUntagged
                     resultFile = null
                     savedTo = null
                     error = null
@@ -353,7 +367,12 @@ class ConverterViewModel(app: Application) : AndroidViewModel(app) {
             Attempt(Composition.HDR_MODE_TONE_MAP_HDR_TO_SDR_USING_OPEN_GL, CURVE_NONE, "GPU fallback"),
             Attempt(Composition.HDR_MODE_TONE_MAP_HDR_TO_SDR_USING_MEDIACODEC, CURVE_NONE, "phone fallback")
         )
-        toneMap -> listOf(Attempt(Composition.HDR_MODE_TONE_MAP_HDR_TO_SDR_USING_OPEN_GL, CURVE_NONE, null))
+        // No HDR tags (PS5 clips, or user forced tone-mapping on): every decoder passes the
+        // raw PQ values through as if SDR, which is exactly what our LUT expects.
+        toneMap -> listOf(
+            Attempt(Composition.HDR_MODE_KEEP_HDR, CURVE_HDR_LUT, "ClipShrink curve (untagged HDR)"),
+            Attempt(Composition.HDR_MODE_KEEP_HDR, CURVE_NONE, "none, colour table failed")
+        )
         else -> listOf(Attempt(Composition.HDR_MODE_KEEP_HDR, CURVE_NONE, null))
     }
 
@@ -405,7 +424,7 @@ class ConverterViewModel(app: Application) : AndroidViewModel(app) {
             if (idx + 1 < attempts.size) {
                 main.post { startExport(c, scale, n, attempts, idx + 1) }
             } else {
-                val hint = if (c.hdr && !toneMap) " Turn on tone-mapping for HDR clips." else ""
+                val hint = if ((c.hdr || c.untaggedHdr) && !toneMap) " Turn on tone-mapping for HDR clips." else ""
                 fail("Conversion failed ($reason).$hint")
             }
         }
