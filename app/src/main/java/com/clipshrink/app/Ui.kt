@@ -331,6 +331,7 @@ fun ClipShrinkApp(
             Panel(Green) {
                 T("Done", Green, 18, true)
                 T(fmtMb(f.length()), Txt, 14, true, true)
+                vm.methodLabel?.let { T(it, Dim, 12, mono = true) }
                 if (f.length() > limit) T("Slightly over target, try a smaller size.", Yellow, 13)
                 val saved = vm.savedTo
                 when {

@@ -17,10 +17,6 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: 8.9
-      - name: Debug keystore
-        run: |
-          mkdir -p ~/.android
-          [ -f ~/.android/debug.keystore ] || keytool -genkeypair -keystore ~/.android/debug.keystore -alias androiddebugkey -storepass android -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
       - run: gradle assembleRelease --no-daemon
       - run: cp app/build/outputs/apk/release/app-release.apk ClipShrink.apk
       - uses: actions/upload-artifact@v4

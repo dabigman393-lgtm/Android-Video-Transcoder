@@ -10,12 +10,22 @@ import kotlin.math.pow
  *
  * Input to the LUT: R'G'B' code values produced by a BT.709 YCbCr->RGB conversion of PQ data.
  * Steps per grid point: undo the 709 matrix and redo it as BT.2020, PQ -> nits, exposure,
- * BT.2020 -> BT.709 primaries, max-RGB extended Reinhard tone map, gamma encode.
+ * BT.2020 -> BT.709 primaries, max-RGB filmic (Hable) tone map, gamma encode.
+ *
+ * Default exposure maps roughly: 150 nits -> code 130, 350 -> 172, 800 -> 212, 2000 -> 244,
+ * full white at ~3200 nits, so sunny game scenes keep texture instead of turning white.
  */
 object HdrLut {
     const val SIZE = 33
-    private const val REF_NITS = 100.0      // nits mapped to the curve's "1.0"
-    private const val PEAK = 40.0           // 4000 nits in REF units reaches full white
+    private const val EXPOSURE = 0.005      // nits -> filmic curve input
+    private const val WHITE = 16.0          // curve input that reaches full white
+
+    private fun hable(x: Double): Double {
+        val a = 0.15; val b = 0.50; val c = 0.10; val d = 0.20; val e = 0.02; val f = 0.30
+        return ((x * (a * x + c * b) + d * e) / (x * (a * x + b) + d * f)) - e / f
+    }
+
+    private val WHITE_SCALE = hable(WHITE)
 
     private fun pqToNits(e: Double): Double {
         val m1 = 0.1593017578125
@@ -29,9 +39,9 @@ object HdrLut {
         return 10000.0 * (num / den).pow(1.0 / m1)
     }
 
-    /** level -3..+3 changes exposure by 25% per step. */
+    /** level -3..+3 changes exposure by 40% per step. */
     fun build(level: Int): Array<Array<IntArray>> {
-        val exposure = 1.25.pow(level.toDouble())
+        val exposure = EXPOSURE * 1.4.pow(level.toDouble())
         return Array(SIZE) { ri ->
             Array(SIZE) { gi ->
                 IntArray(SIZE) { bi ->
@@ -45,18 +55,18 @@ object HdrLut {
                     val r2 = (y + 1.4746 * cr).coerceIn(0.0, 1.0)
                     val b2 = (y + 1.8814 * cb).coerceIn(0.0, 1.0)
                     val g2 = ((y - 0.2627 * r2 - 0.0593 * b2) / 0.6780).coerceIn(0.0, 1.0)
-                    // Linear, relative to REF_NITS.
-                    val lr = pqToNits(r2) / REF_NITS * exposure
-                    val lg = pqToNits(g2) / REF_NITS * exposure
-                    val lb = pqToNits(b2) / REF_NITS * exposure
+                    // Linear nits scaled into the curve's input range.
+                    val lr = pqToNits(r2) * exposure
+                    val lg = pqToNits(g2) * exposure
+                    val lb = pqToNits(b2) * exposure
                     // BT.2020 -> BT.709 primaries.
                     var o0 = max(1.6605 * lr - 0.5876 * lg - 0.0728 * lb, 0.0)
                     var o1 = max(-0.1246 * lr + 1.1329 * lg - 0.0083 * lb, 0.0)
                     var o2 = max(-0.0182 * lr - 0.1006 * lg + 1.1187 * lb, 0.0)
-                    // Extended Reinhard on max channel keeps hue and avoids clipped highlights.
+                    // Filmic curve on the max channel: keeps hue, deep shadows and soft highlights.
                     val m = max(o0, max(o1, o2))
-                    if (m > 0.0) {
-                        val t = m * (1.0 + m / (PEAK * PEAK)) / (1.0 + m)
+                    if (m > 1e-6) {
+                        val t = max(hable(m), 0.0) / WHITE_SCALE
                         val k = t / m
                         o0 *= k; o1 *= k; o2 *= k
                     }

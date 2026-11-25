@@ -12,13 +12,21 @@ android {
         applicationId = "com.clipshrink.app"
         minSdk = 29
         targetSdk = 35
-        versionCode = 3
-        versionName = "1.2.0"
+        versionCode = (System.getenv("GITHUB_RUN_NUMBER") ?: "1").toInt()
+        versionName = "1.3.0"
+    }
+    signingConfigs {
+        create("release") {
+            storeFile = rootProject.file("keystore/clipshrink.jks")
+            storePassword = "clipshrink"
+            keyAlias = "clipshrink"
+            keyPassword = "clipshrink"
+        }
     }
     buildTypes {
         release {
             isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName("release")
         }
     }
     compileOptions {

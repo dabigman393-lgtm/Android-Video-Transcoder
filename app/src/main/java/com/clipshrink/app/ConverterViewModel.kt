@@ -115,6 +115,8 @@ class ConverterViewModel(app: Application) : AndroidViewModel(app) {
         private set
     var savedTo by mutableStateOf<String?>(null)
         private set
+    var methodLabel by mutableStateOf<String?>(null)
+        private set
     var saving by mutableStateOf(false)
         private set
 
@@ -340,6 +342,7 @@ class ConverterViewModel(app: Application) : AndroidViewModel(app) {
         }
         resultFile = null
         savedTo = null
+        methodLabel = null
         error = null
         progress = 0f
         busy = true
@@ -408,6 +411,12 @@ class ConverterViewModel(app: Application) : AndroidViewModel(app) {
                             main.removeCallbacks(poll)
                             transformer = null
                             progress = 1f
+                            methodLabel = when (mode) {
+                                Composition.HDR_MODE_EXPERIMENTAL_FORCE_INTERPRET_HDR_AS_SDR -> "HDR → SDR: ClipShrink curve"
+                                Composition.HDR_MODE_TONE_MAP_HDR_TO_SDR_USING_OPEN_GL -> "HDR → SDR: fallback (GPU)"
+                                Composition.HDR_MODE_TONE_MAP_HDR_TO_SDR_USING_MEDIACODEC -> "HDR → SDR: fallback (phone)"
+                                else -> null
+                            }
                             resultFile = out
                             busy = false
                             if (autoSave) saveResult()
