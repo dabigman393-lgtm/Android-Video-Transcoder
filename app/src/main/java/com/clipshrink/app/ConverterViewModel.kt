@@ -28,6 +28,7 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.MimeTypes
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.effect.RgbAdjustment
+import androidx.media3.effect.SingleColorLut
 import androidx.media3.effect.FrameDropEffect
 import androidx.media3.effect.Presentation
 import androidx.media3.transformer.Composition
@@ -342,7 +343,9 @@ class ConverterViewModel(app: Application) : AndroidViewModel(app) {
         error = null
         progress = 0f
         busy = true
-        val mode = if (toneMap) Composition.HDR_MODE_TONE_MAP_HDR_TO_SDR_USING_MEDIACODEC
+        // Own tone mapping first (read HDR as raw SDR + our LUT), phone tone mappers as fallbacks.
+        val mode = if (toneMap && c.hdr) Composition.HDR_MODE_EXPERIMENTAL_FORCE_INTERPRET_HDR_AS_SDR
+        else if (toneMap) Composition.HDR_MODE_TONE_MAP_HDR_TO_SDR_USING_OPEN_GL
         else Composition.HDR_MODE_KEEP_HDR
         startExport(c, 1.0, 1, mode)
     }
@@ -371,7 +374,9 @@ class ConverterViewModel(app: Application) : AndroidViewModel(app) {
             val fx = ArrayList<Effect>()
             if (p.drop) fx.add(FrameDropEffect.createDefaultFrameDropEffect(p.fps.toFloat()))
             if (p.scaleDown) fx.add(Presentation.createForWidthAndHeight(p.w, p.h, Presentation.LAYOUT_SCALE_TO_FIT))
-            if (brightLevel != 0) {
+            if (mode == Composition.HDR_MODE_EXPERIMENTAL_FORCE_INTERPRET_HDR_AS_SDR) {
+                fx.add(SingleColorLut.createFromCube(HdrLut.build(brightLevel)))
+            } else if (brightLevel != 0) {
                 val k = 1f + 0.07f * brightLevel
                 fx.add(RgbAdjustment.Builder().setRedScale(k).setGreenScale(k).setBlueScale(k).build())
             }
@@ -415,8 +420,15 @@ class ConverterViewModel(app: Application) : AndroidViewModel(app) {
                         exportException: ExportException
                     ) {
                         out.delete()
-                        if (mode == Composition.HDR_MODE_TONE_MAP_HDR_TO_SDR_USING_MEDIACODEC) {
-                            main.post { startExport(c, scale, n, Composition.HDR_MODE_TONE_MAP_HDR_TO_SDR_USING_OPEN_GL) }
+                        val fallback = when (mode) {
+                            Composition.HDR_MODE_EXPERIMENTAL_FORCE_INTERPRET_HDR_AS_SDR ->
+                                Composition.HDR_MODE_TONE_MAP_HDR_TO_SDR_USING_OPEN_GL
+                            Composition.HDR_MODE_TONE_MAP_HDR_TO_SDR_USING_OPEN_GL ->
+                                Composition.HDR_MODE_TONE_MAP_HDR_TO_SDR_USING_MEDIACODEC
+                            else -> null
+                        }
+                        if (fallback != null) {
+                            main.post { startExport(c, scale, n, fallback) }
                         } else {
                             val hint = if (c.hdr && mode == Composition.HDR_MODE_KEEP_HDR) " Turn on tone-mapping for HDR clips." else ""
                             fail("Conversion failed (${exportException.errorCodeName}).$hint")
