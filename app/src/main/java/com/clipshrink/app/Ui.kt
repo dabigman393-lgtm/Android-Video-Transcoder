@@ -187,7 +187,8 @@ fun ClipShrinkApp(
         } else {
             val limit = vm.targetMb * 1048576L
             val plan = Planner.plan(c, vm.targetMb)
-            val small = c.sizeBytes in 1..limit && !vm.toneMap
+            val effectOn = if (c.hdr) vm.toneMap else vm.enhance
+            val small = c.sizeBytes in 1..limit && !effectOn
 
             Panel {
                 val bmp = vm.thumb
@@ -206,10 +207,16 @@ fun ClipShrinkApp(
                             .align(Alignment.TopStart)
                             .padding(8.dp)
                             .clip(RoundedCornerShape(50))
-                            .background(if (vm.toneMap) Yellow else Line)
+                            .background(if (effectOn) Yellow else Line)
                             .padding(horizontal = 10.dp, vertical = 4.dp)
                     ) {
-                        T(if (vm.toneMap) "HDR → SDR" else "SDR", if (vm.toneMap) Color.Black else Txt, 12, true)
+                        val badge = when {
+                            c.hdr && vm.toneMap -> "HDR → SDR"
+                            c.hdr -> "HDR"
+                            vm.enhance -> "SDR · enhance"
+                            else -> "SDR"
+                        }
+                        T(badge, if (effectOn) Color.Black else Txt, 12, true)
                     }
                 }
                 T(c.name, Txt, 15, true, maxLines = 1)
@@ -240,7 +247,11 @@ fun ClipShrinkApp(
             }
 
             Panel {
-                Opt("Tone-map HDR → SDR", "Fixes washed-out colours on HDR clips", vm.toneMap, !vm.busy) { vm.toneMap = it }
+                if (c.hdr) {
+                    Opt("Tone-map HDR → SDR", "Converts HDR so it looks right on any screen", vm.toneMap, !vm.busy) { vm.toneMap = it }
+                } else {
+                    Opt("Fix washed-out look", "Deeper shadows and richer colour, great for PS5 captures", vm.enhance, !vm.busy) { vm.updateEnhance(it) }
+                }
                 val lvl = vm.brightLevel
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) {

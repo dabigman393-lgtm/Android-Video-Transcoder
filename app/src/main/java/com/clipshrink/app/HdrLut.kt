@@ -95,4 +95,28 @@ object HdrLut {
             }
         }
     }
+
+    /**
+     * Washed-out SDR (e.g. PS5 MP4 captures of HDR games): moves the lifted black point down,
+     * deepens mid-tones with a gamma curve and restores saturation. White stays white.
+     * Default: black point 6%, gamma 1.25, saturation x1.15; each brightness step changes gamma by 15%.
+     */
+    fun buildSdrEnhance(level: Int): Array<Array<IntArray>> {
+        val black = 0.06
+        val gamma = 1.25 / 1.15.pow(level.toDouble())
+        val sat = 1.15
+        fun tone(v: Double) = ((v - black) / (1.0 - black)).coerceIn(0.0, 1.0).pow(gamma)
+        return Array(SIZE) { ri ->
+            Array(SIZE) { gi ->
+                IntArray(SIZE) { bi ->
+                    val r = tone(ri / (SIZE - 1.0))
+                    val g = tone(gi / (SIZE - 1.0))
+                    val b = tone(bi / (SIZE - 1.0))
+                    val y = 0.2126 * r + 0.7152 * g + 0.0722 * b
+                    fun out(v: Double) = ((y + (v - y) * sat).coerceIn(0.0, 1.0) * 255.0 + 0.5).toInt()
+                    (0xFF shl 24) or (out(r) shl 16) or (out(g) shl 8) or out(b)
+                }
+            }
+        }
+    }
 }

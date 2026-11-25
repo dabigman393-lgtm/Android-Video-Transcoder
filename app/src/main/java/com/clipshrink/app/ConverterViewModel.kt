@@ -54,9 +54,7 @@ data class Clip(
     val height: Int,
     val fps: Float,
     /** HDR flagged in the file's colour info (PQ/HLG). */
-    val hdr: Boolean,
-    /** 10-bit HDR-capable profile but no HDR tags, e.g. PS5 captures: raw PQ read as SDR. */
-    val untaggedHdr: Boolean
+    val hdr: Boolean
 )
 
 data class Plan(
@@ -115,6 +113,14 @@ class ConverterViewModel(app: Application) : AndroidViewModel(app) {
         private set
     var autoSave by mutableStateOf(prefs.getBoolean("autosave", true))
         private set
+    /** SDR clips: deepen lifted shadows and restore colour (PS5 captures look washed out). */
+    var enhance by mutableStateOf(prefs.getBoolean("enhance", true))
+        private set
+
+    fun updateEnhance(on: Boolean) {
+        enhance = on
+        prefs.edit().putBoolean("enhance", on).apply()
+    }
     var folderUri by mutableStateOf(prefs.getString("folder", null)?.let { Uri.parse(it) })
         private set
     var savedTo by mutableStateOf<String?>(null)
@@ -280,7 +286,6 @@ class ConverterViewModel(app: Application) : AndroidViewModel(app) {
             var h = 0
             var fps = 0f
             var hdr = false
-            var tenBit = false
             try {
                 val ex = MediaExtractor()
                 try {
@@ -298,20 +303,14 @@ class ConverterViewModel(app: Application) : AndroidViewModel(app) {
                             val t = f.getInteger(MediaFormat.KEY_COLOR_TRANSFER)
                             hdr = t == MediaFormat.COLOR_TRANSFER_ST2084 || t == MediaFormat.COLOR_TRANSFER_HLG
                         }
-                        if (f.containsKey(MediaFormat.KEY_PROFILE)) {
+                        if (!hdr && f.containsKey(MediaFormat.KEY_PROFILE)) {
                             val p = f.getInteger(MediaFormat.KEY_PROFILE)
-                            tenBit = when (mime) {
-                                MediaFormat.MIMETYPE_VIDEO_HEVC -> p == CodecProfileLevel.HEVCProfileMain10 ||
-                                    p == CodecProfileLevel.HEVCProfileMain10HDR10 ||
-                                    p == CodecProfileLevel.HEVCProfileMain10HDR10Plus
-                                MediaFormat.MIMETYPE_VIDEO_VP9 -> p == CodecProfileLevel.VP9Profile2 ||
-                                    p == CodecProfileLevel.VP9Profile2HDR ||
-                                    p == CodecProfileLevel.VP9Profile2HDR10Plus
-                                MediaFormat.MIMETYPE_VIDEO_AV1 -> p == CodecProfileLevel.AV1ProfileMain10 ||
-                                    p == CodecProfileLevel.AV1ProfileMain10HDR10 ||
-                                    p == CodecProfileLevel.AV1ProfileMain10HDR10Plus
-                                else -> false
-                            }
+                            hdr = p == CodecProfileLevel.VP9Profile2HDR ||
+                                p == CodecProfileLevel.VP9Profile2HDR10Plus ||
+                                p == CodecProfileLevel.HEVCProfileMain10HDR10 ||
+                                p == CodecProfileLevel.HEVCProfileMain10HDR10Plus ||
+                                p == CodecProfileLevel.AV1ProfileMain10HDR10 ||
+                                p == CodecProfileLevel.AV1ProfileMain10HDR10Plus
                         }
                         break
                     }
@@ -333,14 +332,13 @@ class ConverterViewModel(app: Application) : AndroidViewModel(app) {
             }
             val fName = name; val fSize = size; val fW = w; val fH = h
             val fFps = fps; val fHdr = hdr; val fDur = dur; val fBmp = bmp
-            val fUntagged = !hdr && tenBit
             main.post {
                 if (fDur <= 0L || fW <= 0 || fH <= 0) {
                     error = "Couldn't read that video."
                 } else {
-                    clip = Clip(uri, fName, fSize, fDur, fW, fH, fFps, fHdr, fUntagged)
+                    clip = Clip(uri, fName, fSize, fDur, fW, fH, fFps, fHdr)
                     thumb = fBmp
-                    toneMap = fHdr || fUntagged
+                    toneMap = fHdr
                     resultFile = null
                     savedTo = null
                     error = null
@@ -356,22 +354,21 @@ class ConverterViewModel(app: Application) : AndroidViewModel(app) {
         const val CURVE_NONE = 0      // brightness via simple RGB scale
         const val CURVE_HDR_LUT = 1   // our full PQ -> SDR filmic LUT
         const val CURVE_SDR_GAMMA = 2 // darkening gamma LUT after the GPU tone mapper
+        const val CURVE_SDR_ENHANCE = 3 // black point + gamma + saturation for washed-out SDR
     }
 
     private var failures = ArrayList<String>()
 
     private fun attemptsFor(c: Clip): List<Attempt> = when {
         toneMap && c.hdr -> listOf(
-            Attempt(Composition.HDR_MODE_EXPERIMENTAL_FORCE_INTERPRET_HDR_AS_SDR, CURVE_HDR_LUT, "ClipShrink curve"),
-            Attempt(Composition.HDR_MODE_TONE_MAP_HDR_TO_SDR_USING_OPEN_GL, CURVE_SDR_GAMMA, "GPU + ClipShrink correction"),
-            Attempt(Composition.HDR_MODE_TONE_MAP_HDR_TO_SDR_USING_OPEN_GL, CURVE_NONE, "GPU fallback"),
-            Attempt(Composition.HDR_MODE_TONE_MAP_HDR_TO_SDR_USING_MEDIACODEC, CURVE_NONE, "phone fallback")
+            Attempt(Composition.HDR_MODE_EXPERIMENTAL_FORCE_INTERPRET_HDR_AS_SDR, CURVE_HDR_LUT, "HDR → SDR: ClipShrink curve"),
+            Attempt(Composition.HDR_MODE_TONE_MAP_HDR_TO_SDR_USING_OPEN_GL, CURVE_SDR_GAMMA, "HDR → SDR: GPU + ClipShrink correction"),
+            Attempt(Composition.HDR_MODE_TONE_MAP_HDR_TO_SDR_USING_OPEN_GL, CURVE_NONE, "HDR → SDR: GPU fallback"),
+            Attempt(Composition.HDR_MODE_TONE_MAP_HDR_TO_SDR_USING_MEDIACODEC, CURVE_NONE, "HDR → SDR: phone fallback")
         )
-        // No HDR tags (PS5 clips, or user forced tone-mapping on): every decoder passes the
-        // raw PQ values through as if SDR, which is exactly what our LUT expects.
-        toneMap -> listOf(
-            Attempt(Composition.HDR_MODE_KEEP_HDR, CURVE_HDR_LUT, "ClipShrink curve (untagged HDR)"),
-            Attempt(Composition.HDR_MODE_KEEP_HDR, CURVE_NONE, "none, colour table failed")
+        !c.hdr && enhance -> listOf(
+            Attempt(Composition.HDR_MODE_KEEP_HDR, CURVE_SDR_ENHANCE, "SDR: enhanced"),
+            Attempt(Composition.HDR_MODE_KEEP_HDR, CURVE_NONE, "SDR: plain (enhance failed)")
         )
         else -> listOf(Attempt(Composition.HDR_MODE_KEEP_HDR, CURVE_NONE, null))
     }
@@ -424,7 +421,7 @@ class ConverterViewModel(app: Application) : AndroidViewModel(app) {
             if (idx + 1 < attempts.size) {
                 main.post { startExport(c, scale, n, attempts, idx + 1) }
             } else {
-                val hint = if ((c.hdr || c.untaggedHdr) && !toneMap) " Turn on tone-mapping for HDR clips." else ""
+                val hint = if (c.hdr && !toneMap) " Turn on tone-mapping for HDR clips." else ""
                 fail("Conversion failed ($reason).$hint")
             }
         }
@@ -439,6 +436,7 @@ class ConverterViewModel(app: Application) : AndroidViewModel(app) {
             when (a.curve) {
                 CURVE_HDR_LUT -> fx.add(SingleColorLut.createFromCube(HdrLut.build(brightLevel)))
                 CURVE_SDR_GAMMA -> fx.add(SingleColorLut.createFromCube(HdrLut.buildSdrGamma(brightLevel)))
+                CURVE_SDR_ENHANCE -> fx.add(SingleColorLut.createFromCube(HdrLut.buildSdrEnhance(brightLevel)))
                 else -> if (brightLevel != 0) {
                     val k = 1.4.pow(brightLevel.toDouble()).toFloat().coerceAtMost(1.6f)
                     fx.add(RgbAdjustment.Builder().setRedScale(k).setGreenScale(k).setBlueScale(k).build())
@@ -474,7 +472,7 @@ class ConverterViewModel(app: Application) : AndroidViewModel(app) {
                             progress = 1f
                             methodLabel = a.label?.let { lbl ->
                                 val skipped = failures.firstOrNull()?.let { "\nSkipped → $it" } ?: ""
-                                "HDR → SDR: $lbl$skipped"
+                                "$lbl$skipped"
                             }
                             resultFile = out
                             busy = false
