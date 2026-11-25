@@ -42,6 +42,7 @@ import androidx.media3.transformer.ProgressHolder
 import androidx.media3.transformer.Transformer
 import androidx.media3.transformer.VideoEncoderSettings
 import java.io.File
+import kotlin.math.pow
 import kotlin.math.roundToInt
 
 data class Clip(
@@ -334,6 +335,28 @@ class ConverterViewModel(app: Application) : AndroidViewModel(app) {
         }.start()
     }
 
+    /** One way of producing the output; tried in order until one succeeds. */
+    private data class Attempt(val mode: Int, val curve: Int, val label: String?)
+
+    private companion object {
+        const val CURVE_NONE = 0      // brightness via simple RGB scale
+        const val CURVE_HDR_LUT = 1   // our full PQ -> SDR filmic LUT
+        const val CURVE_SDR_GAMMA = 2 // darkening gamma LUT after the GPU tone mapper
+    }
+
+    private var failures = ArrayList<String>()
+
+    private fun attemptsFor(c: Clip): List<Attempt> = when {
+        toneMap && c.hdr -> listOf(
+            Attempt(Composition.HDR_MODE_EXPERIMENTAL_FORCE_INTERPRET_HDR_AS_SDR, CURVE_HDR_LUT, "ClipShrink curve"),
+            Attempt(Composition.HDR_MODE_TONE_MAP_HDR_TO_SDR_USING_OPEN_GL, CURVE_SDR_GAMMA, "GPU + ClipShrink correction"),
+            Attempt(Composition.HDR_MODE_TONE_MAP_HDR_TO_SDR_USING_OPEN_GL, CURVE_NONE, "GPU fallback"),
+            Attempt(Composition.HDR_MODE_TONE_MAP_HDR_TO_SDR_USING_MEDIACODEC, CURVE_NONE, "phone fallback")
+        )
+        toneMap -> listOf(Attempt(Composition.HDR_MODE_TONE_MAP_HDR_TO_SDR_USING_OPEN_GL, CURVE_NONE, null))
+        else -> listOf(Attempt(Composition.HDR_MODE_KEEP_HDR, CURVE_NONE, null))
+    }
+
     fun convert() {
         val c = clip ?: return
         if (busy) return
@@ -346,11 +369,8 @@ class ConverterViewModel(app: Application) : AndroidViewModel(app) {
         error = null
         progress = 0f
         busy = true
-        // Own tone mapping first (read HDR as raw SDR + our LUT), phone tone mappers as fallbacks.
-        val mode = if (toneMap && c.hdr) Composition.HDR_MODE_EXPERIMENTAL_FORCE_INTERPRET_HDR_AS_SDR
-        else if (toneMap) Composition.HDR_MODE_TONE_MAP_HDR_TO_SDR_USING_OPEN_GL
-        else Composition.HDR_MODE_KEEP_HDR
-        startExport(c, 1.0, 1, mode)
+        failures = ArrayList()
+        startExport(c, 1.0, 1, attemptsFor(c), 0)
     }
 
     fun cancel() {
@@ -367,28 +387,50 @@ class ConverterViewModel(app: Application) : AndroidViewModel(app) {
         error = msg
     }
 
-    private fun startExport(c: Clip, scale: Double, n: Int, mode: Int) {
+    private fun describe(e: Throwable): String {
+        var root: Throwable = e
+        while (root.cause != null && root.cause !== root) root = root.cause!!
+        val m = root.message?.take(90) ?: ""
+        return "${root.javaClass.simpleName}${if (m.isNotEmpty()) ": $m" else ""}"
+    }
+
+    private fun startExport(c: Clip, scale: Double, n: Int, attempts: List<Attempt>, idx: Int) {
+        val a = attempts[idx]
+        val ctx = getApplication<Application>()
+        val out = File(ctx.cacheDir, "ClipShrink_${System.currentTimeMillis()}.mp4")
+
+        fun next(reason: String) {
+            out.delete()
+            failures.add("${a.label ?: "export"}: $reason")
+            if (idx + 1 < attempts.size) {
+                main.post { startExport(c, scale, n, attempts, idx + 1) }
+            } else {
+                val hint = if (c.hdr && !toneMap) " Turn on tone-mapping for HDR clips." else ""
+                fail("Conversion failed ($reason).$hint")
+            }
+        }
+
         try {
-            val ctx = getApplication<Application>()
             val p = Planner.plan(c, targetMb, scale)
             val limit = targetMb * 1048576L
-            val out = File(ctx.cacheDir, "ClipShrink_${System.currentTimeMillis()}.mp4")
 
             val fx = ArrayList<Effect>()
             if (p.drop) fx.add(FrameDropEffect.createDefaultFrameDropEffect(p.fps.toFloat()))
             if (p.scaleDown) fx.add(Presentation.createForWidthAndHeight(p.w, p.h, Presentation.LAYOUT_SCALE_TO_FIT))
-            if (mode == Composition.HDR_MODE_EXPERIMENTAL_FORCE_INTERPRET_HDR_AS_SDR) {
-                fx.add(SingleColorLut.createFromCube(HdrLut.build(brightLevel)))
-            } else if (brightLevel != 0) {
-                val k = 1f + 0.07f * brightLevel
-                fx.add(RgbAdjustment.Builder().setRedScale(k).setGreenScale(k).setBlueScale(k).build())
+            when (a.curve) {
+                CURVE_HDR_LUT -> fx.add(SingleColorLut.createFromCube(HdrLut.build(brightLevel)))
+                CURVE_SDR_GAMMA -> fx.add(SingleColorLut.createFromCube(HdrLut.buildSdrGamma(brightLevel)))
+                else -> if (brightLevel != 0) {
+                    val k = 1.4.pow(brightLevel.toDouble()).toFloat().coerceAtMost(1.6f)
+                    fx.add(RgbAdjustment.Builder().setRedScale(k).setGreenScale(k).setBlueScale(k).build())
+                }
             }
 
             val item = EditedMediaItem.Builder(MediaItem.fromUri(c.uri))
                 .setEffects(Effects(emptyList(), fx))
                 .build()
             val composition = Composition.Builder(listOf(EditedMediaItemSequence(listOf(item))))
-                .setHdrMode(mode)
+                .setHdrMode(a.mode)
                 .build()
 
             val encoder = DefaultEncoderFactory.Builder(ctx)
@@ -405,17 +447,15 @@ class ConverterViewModel(app: Application) : AndroidViewModel(app) {
                         val size = out.length()
                         if (size > limit && n < 3) {
                             out.delete()
-                            val next = scale * (limit * 0.90 / size)
-                            main.post { startExport(c, next, n + 1, mode) }
+                            val nextScale = scale * (limit * 0.90 / size)
+                            main.post { startExport(c, nextScale, n + 1, attempts, idx) }
                         } else {
                             main.removeCallbacks(poll)
                             transformer = null
                             progress = 1f
-                            methodLabel = when (mode) {
-                                Composition.HDR_MODE_EXPERIMENTAL_FORCE_INTERPRET_HDR_AS_SDR -> "HDR → SDR: ClipShrink curve"
-                                Composition.HDR_MODE_TONE_MAP_HDR_TO_SDR_USING_OPEN_GL -> "HDR → SDR: fallback (GPU)"
-                                Composition.HDR_MODE_TONE_MAP_HDR_TO_SDR_USING_MEDIACODEC -> "HDR → SDR: fallback (phone)"
-                                else -> null
+                            methodLabel = a.label?.let { lbl ->
+                                val skipped = failures.firstOrNull()?.let { "\nSkipped → $it" } ?: ""
+                                "HDR → SDR: $lbl$skipped"
                             }
                             resultFile = out
                             busy = false
@@ -428,20 +468,9 @@ class ConverterViewModel(app: Application) : AndroidViewModel(app) {
                         exportResult: ExportResult,
                         exportException: ExportException
                     ) {
-                        out.delete()
-                        val fallback = when (mode) {
-                            Composition.HDR_MODE_EXPERIMENTAL_FORCE_INTERPRET_HDR_AS_SDR ->
-                                Composition.HDR_MODE_TONE_MAP_HDR_TO_SDR_USING_OPEN_GL
-                            Composition.HDR_MODE_TONE_MAP_HDR_TO_SDR_USING_OPEN_GL ->
-                                Composition.HDR_MODE_TONE_MAP_HDR_TO_SDR_USING_MEDIACODEC
-                            else -> null
-                        }
-                        if (fallback != null) {
-                            main.post { startExport(c, scale, n, fallback) }
-                        } else {
-                            val hint = if (c.hdr && mode == Composition.HDR_MODE_KEEP_HDR) " Turn on tone-mapping for HDR clips." else ""
-                            fail("Conversion failed (${exportException.errorCodeName}).$hint")
-                        }
+                        main.removeCallbacks(poll)
+                        transformer = null
+                        next("${exportException.errorCodeName} · ${describe(exportException)}")
                     }
                 })
                 .build()
@@ -451,7 +480,7 @@ class ConverterViewModel(app: Application) : AndroidViewModel(app) {
             main.removeCallbacks(poll)
             main.post(poll)
         } catch (e: Exception) {
-            fail("Couldn't start conversion: ${e.message}")
+            next("setup · ${describe(e)}")
         }
     }
 

@@ -76,4 +76,23 @@ object HdrLut {
             }
         }
     }
+
+    /**
+     * SDR -> SDR correction for output of the GPU tone mapper, which runs bright:
+     * a gamma curve that pulls mid-tones down while keeping black and white fixed.
+     * Default gamma 1.35; each brightness step changes it by 15%.
+     */
+    fun buildSdrGamma(level: Int): Array<Array<IntArray>> {
+        val gamma = 1.35 / 1.15.pow(level.toDouble())
+        val table = IntArray(SIZE) { i ->
+            ((i / (SIZE - 1.0)).pow(gamma) * 255.0 + 0.5).toInt().coerceIn(0, 255)
+        }
+        return Array(SIZE) { ri ->
+            Array(SIZE) { gi ->
+                IntArray(SIZE) { bi ->
+                    (0xFF shl 24) or (table[ri] shl 16) or (table[gi] shl 8) or table[bi]
+                }
+            }
+        }
+    }
 }
