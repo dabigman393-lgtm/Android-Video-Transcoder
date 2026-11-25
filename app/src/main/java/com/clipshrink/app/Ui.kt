@@ -22,6 +22,8 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Slider
+import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
@@ -148,6 +150,7 @@ private fun fmtDur(ms: Long): String {
 fun ClipShrinkApp(
     vm: ConverterViewModel,
     onPick: () -> Unit,
+    onPickFolder: () -> Unit,
     onShare: (File) -> Unit,
     onShareOriginal: (Uri) -> Unit
 ) {
@@ -238,8 +241,46 @@ fun ClipShrinkApp(
 
             Panel {
                 Opt("Tone-map HDR → SDR", "Fixes washed-out colours on HDR clips", vm.toneMap, !vm.busy) { vm.toneMap = it }
-                if (vm.toneMap) {
-                    Opt("Brighter", "Lifts the image if clips look too dark", vm.brighter, !vm.busy) { vm.brighter = it }
+                val lvl = vm.brightLevel
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        T("Brightness", Txt, 15, true)
+                        T("Lower it if clips look too bright, raise it if too dark", Dim, 12)
+                    }
+                    T(
+                        if (lvl == 0) "0" else if (lvl > 0) "+$lvl" else "−${-lvl}",
+                        if (lvl == 0) Dim else Yellow, 16, true, true
+                    )
+                }
+                Slider(
+                    value = lvl.toFloat(),
+                    onValueChange = { vm.updateBrightness(it.roundToInt()) },
+                    valueRange = -3f..3f,
+                    steps = 5,
+                    enabled = !vm.busy,
+                    colors = SliderDefaults.colors(
+                        thumbColor = Orange,
+                        activeTrackColor = Orange,
+                        inactiveTrackColor = Line,
+                        activeTickColor = Color.Black,
+                        inactiveTickColor = Dim
+                    )
+                )
+            }
+
+            Panel {
+                Opt("Auto-save after convert", "Saves a copy as soon as it's done", vm.autoSave, !vm.busy) { vm.updateAutoSave(it) }
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        T("Save to", Dim, 12)
+                        T(vm.folderLabel(), Txt, 14, true, true, maxLines = 1)
+                    }
+                    if (!vm.busy) {
+                        T("Change", Orange, 14, true, modifier = Modifier.clickable(onClick = onPickFolder).padding(8.dp))
+                        if (vm.folderUri != null) {
+                            T("Reset", Yellow, 14, true, modifier = Modifier.clickable { vm.resetFolder() }.padding(8.dp))
+                        }
+                    }
                 }
             }
 
@@ -291,6 +332,12 @@ fun ClipShrinkApp(
                 T("Done", Green, 18, true)
                 T(fmtMb(f.length()), Txt, 14, true, true)
                 if (f.length() > limit) T("Slightly over target, try a smaller size.", Yellow, 13)
+                val saved = vm.savedTo
+                when {
+                    saved != null -> T("Saved to $saved", Green, 13)
+                    vm.saving -> T("Saving…", Dim, 13)
+                    else -> T("Save a copy", Orange, 14, true, modifier = Modifier.clickable { vm.saveResult() })
+                }
                 Btn("Share", Green) { onShare(f) }
             }
         }

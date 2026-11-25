@@ -3,6 +3,11 @@
 package com.clipshrink.app
 
 import android.app.Application
+import android.content.ContentValues
+import android.content.Intent
+import android.os.Environment
+import android.provider.DocumentsContract
+import android.provider.MediaStore
 import android.graphics.Bitmap
 import android.media.MediaCodecInfo.CodecProfileLevel
 import android.media.MediaExtractor
@@ -22,7 +27,7 @@ import androidx.media3.common.Effect
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MimeTypes
 import androidx.media3.common.util.UnstableApi
-import androidx.media3.effect.Brightness
+import androidx.media3.effect.RgbAdjustment
 import androidx.media3.effect.FrameDropEffect
 import androidx.media3.effect.Presentation
 import androidx.media3.transformer.Composition
@@ -98,7 +103,134 @@ class ConverterViewModel(app: Application) : AndroidViewModel(app) {
         private set
     var targetMb by mutableIntStateOf(10)
     var toneMap by mutableStateOf(false)
-    var brighter by mutableStateOf(false)
+    private val prefs = app.getSharedPreferences("settings", 0)
+
+    /** -3 (darkest) .. +3 (brightest), 0 = unchanged. Remembered between launches. */
+    var brightLevel by mutableIntStateOf(prefs.getInt("bright", 0))
+        private set
+    var autoSave by mutableStateOf(prefs.getBoolean("autosave", true))
+        private set
+    var folderUri by mutableStateOf(prefs.getString("folder", null)?.let { Uri.parse(it) })
+        private set
+    var savedTo by mutableStateOf<String?>(null)
+        private set
+    var saving by mutableStateOf(false)
+        private set
+
+    fun updateBrightness(level: Int) {
+        brightLevel = level.coerceIn(-3, 3)
+        prefs.edit().putInt("bright", brightLevel).apply()
+    }
+
+    fun updateAutoSave(on: Boolean) {
+        autoSave = on
+        prefs.edit().putBoolean("autosave", on).apply()
+    }
+
+    fun chooseFolder(uri: Uri) {
+        val cr = getApplication<Application>().contentResolver
+        try {
+            cr.takePersistableUriPermission(
+                uri,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+            )
+        } catch (_: Exception) {
+        }
+        folderUri?.let { old ->
+            if (old != uri) try {
+                cr.releasePersistableUriPermission(
+                    old,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                )
+            } catch (_: Exception) {
+            }
+        }
+        folderUri = uri
+        prefs.edit().putString("folder", uri.toString()).apply()
+    }
+
+    fun resetFolder() {
+        folderUri?.let {
+            try {
+                getApplication<Application>().contentResolver.releasePersistableUriPermission(
+                    it,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                )
+            } catch (_: Exception) {
+            }
+        }
+        folderUri = null
+        prefs.edit().remove("folder").apply()
+    }
+
+    fun folderLabel(): String {
+        val u = folderUri ?: return "Downloads/ClipShrink"
+        return try {
+            val id = DocumentsContract.getTreeDocumentId(u)
+            val path = id.substringAfter(':', id)
+            if (path.isEmpty()) "Phone storage" else path
+        } catch (_: Exception) {
+            "Chosen folder"
+        }
+    }
+
+    private fun outputName(c: Clip): String {
+        val base = c.name.substringBeforeLast('.').ifBlank { "clip" }
+            .replace(Regex("[^A-Za-z0-9 _-]"), "_").take(60)
+        return "${base}_${targetMb}MB_${System.currentTimeMillis() / 1000}.mp4"
+    }
+
+    fun saveResult() {
+        val f = resultFile ?: return
+        val c = clip ?: return
+        if (saving) return
+        saving = true
+        val ctx = getApplication<Application>()
+        val name = outputName(c)
+        val tree = folderUri
+        val label = folderLabel()
+        Thread {
+            var msg: String? = null
+            var err: String? = null
+            try {
+                val cr = ctx.contentResolver
+                if (tree != null) {
+                    val parent = DocumentsContract.buildDocumentUriUsingTree(
+                        tree, DocumentsContract.getTreeDocumentId(tree)
+                    )
+                    val doc = DocumentsContract.createDocument(cr, parent, "video/mp4", name)
+                        ?: throw IllegalStateException("couldn't create file")
+                    cr.openOutputStream(doc)!!.use { o -> f.inputStream().use { it.copyTo(o) } }
+                } else {
+                    val v = ContentValues().apply {
+                        put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+                        put(MediaStore.MediaColumns.MIME_TYPE, "video/mp4")
+                        put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/ClipShrink")
+                        put(MediaStore.MediaColumns.IS_PENDING, 1)
+                    }
+                    val item = cr.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v)
+                        ?: throw IllegalStateException("couldn't create file")
+                    try {
+                        cr.openOutputStream(item)!!.use { o -> f.inputStream().use { it.copyTo(o) } }
+                        v.clear()
+                        v.put(MediaStore.MediaColumns.IS_PENDING, 0)
+                        cr.update(item, v, null, null)
+                    } catch (e: Exception) {
+                        cr.delete(item, null, null)
+                        throw e
+                    }
+                }
+                msg = "$label/$name"
+            } catch (e: Exception) {
+                err = if (tree != null) "Couldn't save to $label. Pick the folder again." else "Couldn't save: ${e.message}"
+            }
+            main.post {
+                saving = false
+                if (msg != null) savedTo = msg
+                if (err != null) error = err
+            }
+        }.start()
+    }
     var busy by mutableStateOf(false)
         private set
     var progress by mutableFloatStateOf(0f)
@@ -192,6 +324,7 @@ class ConverterViewModel(app: Application) : AndroidViewModel(app) {
                     thumb = fBmp
                     toneMap = fHdr
                     resultFile = null
+                    savedTo = null
                     error = null
                 }
             }
@@ -205,6 +338,7 @@ class ConverterViewModel(app: Application) : AndroidViewModel(app) {
             if (it.name.startsWith("ClipShrink_")) it.delete()
         }
         resultFile = null
+        savedTo = null
         error = null
         progress = 0f
         busy = true
@@ -237,7 +371,10 @@ class ConverterViewModel(app: Application) : AndroidViewModel(app) {
             val fx = ArrayList<Effect>()
             if (p.drop) fx.add(FrameDropEffect.createDefaultFrameDropEffect(p.fps.toFloat()))
             if (p.scaleDown) fx.add(Presentation.createForWidthAndHeight(p.w, p.h, Presentation.LAYOUT_SCALE_TO_FIT))
-            if (toneMap && brighter) fx.add(Brightness(0.08f))
+            if (brightLevel != 0) {
+                val k = 1f + 0.07f * brightLevel
+                fx.add(RgbAdjustment.Builder().setRedScale(k).setGreenScale(k).setBlueScale(k).build())
+            }
 
             val item = EditedMediaItem.Builder(MediaItem.fromUri(c.uri))
                 .setEffects(Effects(emptyList(), fx))
@@ -268,6 +405,7 @@ class ConverterViewModel(app: Application) : AndroidViewModel(app) {
                             progress = 1f
                             resultFile = out
                             busy = false
+                            if (autoSave) saveResult()
                         }
                     }
 

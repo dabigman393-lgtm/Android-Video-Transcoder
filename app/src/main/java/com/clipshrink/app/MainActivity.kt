@@ -31,9 +31,13 @@ class MainActivity : ComponentActivity() {
                 val picker = rememberLauncherForActivityResult(
                     ActivityResultContracts.OpenDocument()
                 ) { uri -> if (uri != null) vm.loadClip(uri) }
+                val folderPicker = rememberLauncherForActivityResult(
+                    ActivityResultContracts.OpenDocumentTree()
+                ) { uri -> if (uri != null) vm.chooseFolder(uri) }
                 ClipShrinkApp(
                     vm = vm,
                     onPick = { picker.launch(arrayOf("video/*")) },
+                    onPickFolder = { folderPicker.launch(null) },
                     onShare = { f -> shareFile(f) },
                     onShareOriginal = { u -> shareUri(u, contentResolver.getType(u) ?: "video/*") }
                 )
