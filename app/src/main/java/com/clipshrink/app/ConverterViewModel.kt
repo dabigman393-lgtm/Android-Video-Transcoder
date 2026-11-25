@@ -62,38 +62,61 @@ data class Plan(
     val audioBps: Int,
     val w: Int,
     val h: Int,
+    /** Short side of the output, used for the "1080p" style label. */
+    val p: Int,
     val fps: Int,
     val scaleDown: Boolean,
     val drop: Boolean,
     val tooTight: Boolean,
+    /** Too few bits per pixel for the chosen resolution: expect blockiness. */
+    val lowQuality: Boolean,
     val estBytes: Long
 )
 
 object Planner {
-    fun plan(c: Clip, targetMb: Int, scale: Double = 1.0): Plan {
+    val RESOLUTIONS = listOf(360, 480, 540, 720, 1080, 1440, 2160)
+
+    /** Resolution choices for a clip: every preset below the source, plus the source itself. */
+    fun options(c: Clip): List<Int> {
+        val src = minOf(c.width, c.height)
+        return RESOLUTIONS.filter { it < src } + src
+    }
+
+    /**
+     * @param res requested short side in pixels, or 0 for automatic (picked from the bitrate).
+     */
+    fun plan(c: Clip, targetMb: Int, scale: Double = 1.0, res: Int = 0): Plan {
         val secs = (c.durationMs / 1000.0).coerceAtLeast(0.5)
         val total = targetMb * 1048576.0 * 0.92 * 8.0 / secs
         val audio = 132_000
         val base = (total * 0.97 - audio).coerceAtLeast(100_000.0)
-        val tierH: Int
+        val tierP: Int
         val tierFps: Int
         when {
-            base >= 6_000_000 -> { tierH = 1080; tierFps = 60 }
-            base >= 3_500_000 -> { tierH = 720; tierFps = 60 }
-            base >= 1_800_000 -> { tierH = 720; tierFps = 30 }
-            base >= 900_000 -> { tierH = 540; tierFps = 30 }
-            else -> { tierH = 360; tierFps = 30 }
+            base >= 16_000_000 -> { tierP = 2160; tierFps = 60 }
+            base >= 10_000_000 -> { tierP = 1440; tierFps = 60 }
+            base >= 6_000_000 -> { tierP = 1080; tierFps = 60 }
+            base >= 3_500_000 -> { tierP = 720; tierFps = 60 }
+            base >= 1_800_000 -> { tierP = 720; tierFps = 30 }
+            base >= 900_000 -> { tierP = 540; tierFps = 30 }
+            else -> { tierP = 360; tierFps = 30 }
         }
-        val srcH = if (c.height > 0) c.height else tierH
-        val h = minOf(tierH, srcH) and 1.inv()
-        val scaleDown = c.height > 0 && c.width > 0 && h < c.height
-        val w = if (scaleDown) ((c.width.toDouble() * h / c.height).roundToInt() and 1.inv()) else c.width
+        val srcShort = minOf(c.width, c.height).coerceAtLeast(2)
+        val wantP = if (res > 0) res else tierP
+        val p = minOf(wantP, srcShort) and 1.inv()
+        val scaleDown = p < srcShort
+        val f = p.toDouble() / srcShort
+        val w = if (scaleDown) ((c.width * f).roundToInt() and 1.inv()) else c.width
+        val h = if (scaleDown) ((c.height * f).roundToInt() and 1.inv()) else c.height
         val srcFps = if (c.fps > 0f) c.fps else 60f
         val drop = tierFps + 1 < srcFps
         val fps = if (drop) tierFps else minOf(tierFps, srcFps.roundToInt())
-        val video = (base * scale).toInt().coerceAtLeast(80_000)
+        // Never spend more than ~0.2 bits per pixel: beyond that H.264 gains nothing visible.
+        val cap = w.toDouble() * h * fps * 0.2
+        val video = minOf(base * scale, cap).toInt().coerceAtLeast(80_000)
+        val bpp = video / (w.toDouble() * h * fps)
         val est = ((video + audio) * secs / 8.0).toLong()
-        return Plan(video, audio, w, h, fps, scaleDown, drop, base < 250_000, est)
+        return Plan(video, audio, w, h, p, fps, scaleDown, drop, base < 250_000, bpp < 0.035, est)
     }
 }
 
@@ -104,9 +127,27 @@ class ConverterViewModel(app: Application) : AndroidViewModel(app) {
         private set
     var thumb by mutableStateOf<Bitmap?>(null)
         private set
-    var targetMb by mutableIntStateOf(10)
-    var toneMap by mutableStateOf(false)
     private val prefs = app.getSharedPreferences("settings", 0)
+    var targetMb by mutableIntStateOf(prefs.getInt("target", 10))
+        private set
+    /** Requested short side in pixels, 0 = automatic. */
+    var resChoice by mutableIntStateOf(prefs.getInt("res", 0))
+        private set
+
+    fun updateTarget(mb: Int) {
+        targetMb = mb.coerceIn(1, 4000)
+        prefs.edit().putInt("target", targetMb).apply()
+    }
+
+    fun updateRes(p: Int) {
+        resChoice = p
+        prefs.edit().putInt("res", p).apply()
+    }
+
+    /** The resolution actually used for this clip: the saved choice, capped at the source. */
+    fun effectiveRes(c: Clip): Int =
+        if (resChoice <= 0) 0 else minOf(resChoice, minOf(c.width, c.height))
+    var toneMap by mutableStateOf(false)
 
     /** -3 (darkest) .. +3 (brightest), 0 = unchanged. Remembered between launches. */
     var brightLevel by mutableIntStateOf(prefs.getInt("bright", 0))
@@ -427,7 +468,7 @@ class ConverterViewModel(app: Application) : AndroidViewModel(app) {
         }
 
         try {
-            val p = Planner.plan(c, targetMb, scale)
+            val p = Planner.plan(c, targetMb, scale, effectiveRes(c))
             val limit = targetMb * 1048576L
 
             val fx = ArrayList<Effect>()

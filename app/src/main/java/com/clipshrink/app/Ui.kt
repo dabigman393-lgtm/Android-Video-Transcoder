@@ -21,7 +21,16 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Switch
@@ -118,6 +127,17 @@ private fun Btn(label: String, bg: Color, enabled: Boolean = true, onClick: () -
 ) { T(label, if (enabled) Color.Black else Dim, 17, true) }
 
 @Composable
+private fun Chip(label: String, sel: Boolean, enabled: Boolean, modifier: Modifier, onClick: () -> Unit) = Box(
+    modifier
+        .height(44.dp)
+        .clip(RoundedCornerShape(12.dp))
+        .background(if (sel) Yellow else Color.Transparent)
+        .border(1.dp, if (sel) Yellow else Line, RoundedCornerShape(12.dp))
+        .clickable(enabled = enabled, onClick = onClick),
+    contentAlignment = Alignment.Center
+) { T(label, if (sel) Color.Black else Txt, 14, true, true, maxLines = 1) }
+
+@Composable
 private fun Opt(title: String, sub: String, on: Boolean, enabled: Boolean, set: (Boolean) -> Unit) = Row(
     Modifier.fillMaxWidth(),
     verticalAlignment = Alignment.CenterVertically
@@ -186,7 +206,7 @@ fun ClipShrinkApp(
             }
         } else {
             val limit = vm.targetMb * 1048576L
-            val plan = Planner.plan(c, vm.targetMb)
+            val plan = Planner.plan(c, vm.targetMb, res = vm.effectiveRes(c))
             val effectOn = if (c.hdr) vm.toneMap else vm.enhance
             val small = c.sizeBytes in 1..limit && !effectOn
 
@@ -229,19 +249,61 @@ fun ClipShrinkApp(
 
             Panel {
                 T("Target size", Dim, 12)
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    listOf(10, 20, 25, 50).forEach { mb ->
-                        val sel = vm.targetMb == mb
-                        Box(
-                            Modifier
-                                .weight(1f)
-                                .height(44.dp)
-                                .clip(RoundedCornerShape(12.dp))
-                                .background(if (sel) Yellow else Color.Transparent)
-                                .border(1.dp, if (sel) Yellow else Line, RoundedCornerShape(12.dp))
-                                .clickable(enabled = !vm.busy) { vm.targetMb = mb },
-                            contentAlignment = Alignment.Center
-                        ) { T("$mb MB", if (sel) Color.Black else Txt, 14, true, true) }
+                val presets = listOf(10, 20, 25, 50, 100, 500)
+                // Kept separate from the value so typing e.g. "20" on the way to "200" doesn't close the box.
+                var customMode by remember { mutableStateOf(vm.targetMb !in presets) }
+                val isCustom = customMode
+                (presets.map { "$it MB" } + "Custom").chunked(4).forEach { row ->
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        row.forEach { label ->
+                            val mb = label.removeSuffix(" MB").toIntOrNull()
+                            val sel = if (mb == null) isCustom else !isCustom && vm.targetMb == mb
+                            Chip(label, sel, !vm.busy, Modifier.weight(1f)) {
+                                customMode = mb == null
+                                if (mb != null) vm.updateTarget(mb)
+                            }
+                        }
+                        repeat(4 - row.size) { Spacer(Modifier.weight(1f)) }
+                    }
+                }
+                if (isCustom) {
+                    var text by remember { mutableStateOf(vm.targetMb.toString()) }
+                    OutlinedTextField(
+                        value = text,
+                        onValueChange = { v ->
+                            text = v.filter { it.isDigit() }.take(4)
+                            text.toIntOrNull()?.takeIf { it > 0 }?.let { vm.updateTarget(it) }
+                        },
+                        enabled = !vm.busy,
+                        singleLine = true,
+                        label = { Text("Size in MB") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = Yellow,
+                            unfocusedBorderColor = Line,
+                            focusedLabelColor = Yellow,
+                            cursorColor = Yellow
+                        ),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+            }
+
+            Panel {
+                T("Resolution", Dim, 12)
+                val eff = vm.effectiveRes(c)
+                (listOf(0) + Planner.options(c)).chunked(4).forEach { row ->
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        row.forEach { p ->
+                            val label = when {
+                                p == 0 -> "Auto"
+                                p == 2160 -> "4K"
+                                p == minOf(c.width, c.height) -> "${p}p src"
+                                else -> "${p}p"
+                            }
+                            Chip(label, eff == p, !vm.busy, Modifier.weight(1f)) { vm.updateRes(p) }
+                        }
+                        repeat(4 - row.size) { Spacer(Modifier.weight(1f)) }
                     }
                 }
             }
@@ -300,10 +362,14 @@ fun ClipShrinkApp(
             when {
                 small -> { estText = "Already under ${vm.targetMb} MB, no need to convert"; estColor = Green }
                 plan.tooTight -> {
-                    estText = "${plan.h}p${plan.fps} · ~${fmtMb(plan.estBytes)} · very soft, try a bigger target"
+                    estText = "${plan.p}p${plan.fps} · ~${fmtMb(plan.estBytes)} · very soft, try a bigger target"
                     estColor = Yellow
                 }
-                else -> { estText = "${plan.h}p${plan.fps} · ~${fmtMb(plan.estBytes)}"; estColor = Green }
+                plan.lowQuality -> {
+                    estText = "${plan.p}p${plan.fps} · ~${fmtMb(plan.estBytes)} · too big for this size, may look blocky"
+                    estColor = Yellow
+                }
+                else -> { estText = "${plan.p}p${plan.fps} · ~${fmtMb(plan.estBytes)}"; estColor = Green }
             }
             T(estText, estColor, 14, true, true)
 
