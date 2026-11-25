@@ -3,6 +3,8 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+permissions:
+  contents: write
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -20,7 +22,13 @@ jobs:
           mkdir -p ~/.android
           [ -f ~/.android/debug.keystore ] || keytool -genkeypair -keystore ~/.android/debug.keystore -alias androiddebugkey -storepass android -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
       - run: gradle assembleRelease --no-daemon
+      - run: cp app/build/outputs/apk/release/app-release.apk ClipShrink.apk
       - uses: actions/upload-artifact@v4
         with:
           name: ClipShrink-apk
           path: app/build/outputs/apk/release/*.apk
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: ClipShrink v1.0.${{ github.run_number }}
+          files: ClipShrink.apk
